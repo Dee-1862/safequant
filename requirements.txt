@@ -1,0 +1,17 @@
+# Base requirements
+torch>=2.3.0
+transformers>=4.43.0
+accelerate>=0.29.3
+bitsandbytes>=0.43.0
+datasets>=2.19.0
+huggingface_hub
+numpy>=1.26.4
+scipy>=1.11.0
+matplotlib
+tqdm
+pytest>=8.0
+
+# AQLM specific requirements
+safetensors==0.4.3
+sentencepiece==0.2.0
+lm-eval==0.4.0

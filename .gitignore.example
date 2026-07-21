@@ -1,0 +1,7 @@
+# Secrets and local env
+.env
+.env.local
+
+# Slurm logs
+scripts/logs/*
+logs/
