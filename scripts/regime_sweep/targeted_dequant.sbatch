@@ -10,20 +10,24 @@
 #SBATCH --error=scripts/logs/tdequant_%j.err
 source "${SLURM_SUBMIT_DIR}/scripts/_env.sh"
 
-# Section 8 -- targeted 4-bit (AWQ) restoration into the 2-bit (AQLM) cell.
-# Two comparable read-side conditions so we can see if the localized middle-band
-# repair matches the full read-side one:
-#   1) read-side, ALL layers      -> read_awq4_all
-#   2) read-side, MIDDLE band 11-22 -> read_awq4_L11-22
+# Section 8 -- targeted mixed-precision repair: dequantize the role projections
+# of a damaged cell (TARGET) to a higher-precision SOURCE quantizer. Runs both
+# ALL-layers and MIDDLE-band [MID_LO,MID_HI) conditions. Override via env, e.g.
+#   TARGET=aqlm2 SOURCE=gptq4    or    TARGET=gptq2 SOURCE=awq
 MODEL="${EXP_MODEL:-llama7b}"
+TARGET="${TARGET:-aqlm2}"
+SOURCE="${SOURCE:-awq}"
+ROLE="${ROLE:-read}"
+NR="${N_REASONING:-100}"
 
-echo "=== targeted 4-bit dequant | ${MODEL} | $(date) ==="
-echo "---- read-side / all layers ----"
+echo "=== targeted dequant | ${MODEL} target=${TARGET} source=${SOURCE} role=${ROLE} nr=${NR} | $(date) ==="
+echo "---- ${ROLE} / all layers ----"
 python -u -m experiments.regime_sweep.targeted_dequant \
-  --model ${MODEL} --quantizer aqlm2 --source_quant awq --role read \
-  --n_eval 200 --n_reasoning 50 || echo "FAILED read/all"
-echo "---- read-side / middle band (11-22) ----"
+  --model ${MODEL} --quantizer ${TARGET} --source_quant ${SOURCE} --role ${ROLE} \
+  --n_eval 200 --n_reasoning ${NR} || echo "FAILED ${TARGET}/${SOURCE}/all"
+echo "---- ${ROLE} / middle band (${MID_LO:-11}-${MID_HI:-22}) ----"
 python -u -m experiments.regime_sweep.targeted_dequant \
-  --model ${MODEL} --quantizer aqlm2 --source_quant awq --role read \
-  --layer_lo ${MID_LO:-11} --layer_hi ${MID_HI:-22} --n_eval 200 --n_reasoning 50 || echo "FAILED read/middle"
+  --model ${MODEL} --quantizer ${TARGET} --source_quant ${SOURCE} --role ${ROLE} \
+  --layer_lo ${MID_LO:-11} --layer_hi ${MID_HI:-22} --n_eval 200 --n_reasoning ${NR} \
+  || echo "FAILED ${TARGET}/${SOURCE}/middle"
 echo "=== done | $(date) ==="
