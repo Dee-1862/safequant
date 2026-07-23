@@ -17,7 +17,15 @@ MODEL="${EXP_MODEL:-llama7b}"
 ROLE="${LRQAT_ROLE:-read}"
 BITS="${LRQAT_BITS:-2}"
 
-echo "=== LR-QAT | ${MODEL}/aqlm2 role=${ROLE} int${BITS} | $(date) ==="
+# Optional depth-band hybrid: inject INT-b adapters only on layers [MID_LO,MID_HI)
+# so most role matrices stay at AQLM-2 -> whole-model bits sit just above 2.
+# Enable by exporting LRQAT_MID_LO / LRQAT_MID_HI (e.g. 11 / 22); else all layers.
+BAND_ARGS=""
+if [ -n "${LRQAT_MID_LO}" ] && [ -n "${LRQAT_MID_HI}" ]; then
+  BAND_ARGS="--layer_lo ${LRQAT_MID_LO} --layer_hi ${LRQAT_MID_HI}"
+fi
+
+echo "=== LR-QAT | ${MODEL}/aqlm2 role=${ROLE} int${BITS} band='${BAND_ARGS:-all}' | $(date) ==="
 # ARC/XSTest n default to the paper-standard 100/250 (override via env) so LR-QAT
 # evals sit on the same n as tab:f3a/headline. n_eval (ASR) stays 200 everywhere.
 BUDGET_ARGS="--steps 3000 --lr 1e-4 --rank 32 --alpha 64 \
@@ -26,5 +34,5 @@ BUDGET_ARGS="--steps 3000 --lr 1e-4 --rank 32 --alpha 64 \
              --n_reasoning ${N_REASONING:-100} --n_xstest ${N_XSTEST:-250}"
 
 python -u -m experiments.trained_repair.lrqat \
-  --model ${MODEL} --quantizer aqlm2 --role ${ROLE} --n_bits ${BITS} ${BUDGET_ARGS}
+  --model ${MODEL} --quantizer aqlm2 --role ${ROLE} --n_bits ${BITS} ${BUDGET_ARGS} ${BAND_ARGS}
 echo "=== done | $(date) ==="

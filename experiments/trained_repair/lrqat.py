@@ -23,7 +23,8 @@ from core.lrqat import (
 )
 from core.manifest import RunConfig, find_result, save_result
 from core.model_loader import load_fp32, load_quantized, get_weight
-from core.restoration import READ_PROJS, WRITE_PROJS, measure_arc
+from core.residuals import get_inner
+from core.restoration import READ_PROJS, WRITE_PROJS, measure_arc, get_proj_sets
 from core.seeds import set_global_seed, DEFAULT_SEED
 
 try:
@@ -283,12 +284,50 @@ def recovery_fraction(asr_repaired, asr_quant, asr_fp16):
     return (asr_quant - asr_repaired) / denom
 
 
+def _proj_numel(layer, dotted):
+    """#params of one projection under a decoder layer, cheaply (no dequant)."""
+    m = layer
+    for p in dotted.split("."):
+        m = getattr(m, p)
+    inf = getattr(m, "in_features", None)
+    outf = getattr(m, "out_features", None)
+    if (inf is None or outf is None) and getattr(m, "weight", None) is not None:
+        outf, inf = m.weight.shape[0], m.weight.shape[1]
+    return int(inf) * int(outf) if inf and outf else 0
+
+
+def _whole_model_effective_bits(model, role_projs, layer_range, base_eff, inj_eff):
+    """Whole-model effective bits/weight: AQLM-2 base on every quantized matrix,
+    INT-b only on the injected (role x band) matrices. Returns (bits, fraction).
+
+    base_eff is the AQLM-2 effective-bit proxy (~2.2); inj_eff is the injected
+    per-matrix effective bits. Defensive: returns (None, None) on any failure so
+    reporting never crashes a 5h run.
+    """
+    try:
+        inner = get_inner(model)
+        read, write = get_proj_sets(model)
+        all_projs = read + write
+        n_layers = model.config.num_hidden_layers
+        layer0 = inner.layers[0]
+        per_all = sum(_proj_numel(layer0, p) for p in all_projs)
+        per_role = sum(_proj_numel(layer0, p) for p in role_projs)
+        lo, hi = layer_range if layer_range else (0, n_layers)
+        total = per_all * n_layers
+        bumped = per_role * (hi - lo)
+        frac = bumped / total if total else 0.0
+        return round(base_eff * (1 - frac) + inj_eff * frac, 3), round(frac, 4)
+    except Exception as e:  # pragma: no cover - reporting only
+        print(f"  [warn] whole-model eff-bits calc failed: {e}")
+        return None, None
+
+
 def main():
     # Parse CLI arguments
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default = "llama7b")
     ap.add_argument("--quantizer", default = "aqlm2")
-    ap.add_argument("--role", choices = ["read", "write"], required = True)
+    ap.add_argument("--role", choices = ["read", "write", "both"], required = True)
     ap.add_argument("--n_bits", type = int, default = 2, help = "2 for the strict story, 4 for sweep")
     ap.add_argument("--group_size", type = int, default = 128,
                     help = "input-dim group width for INT scales (coherence at low bits)")
@@ -314,18 +353,30 @@ def main():
     ap.add_argument("--n_xstest", type = int, default = 50,
                     help = "XSTest prompts for the over-refusal check (0 to skip)")
     ap.add_argument("--max_new_tokens", type = int, default = 256)
+    ap.add_argument("--layer_lo", type = int, default = None,
+                    help = "restrict adapters to layers [lo,hi) for the depth-band hybrid")
+    ap.add_argument("--layer_hi", type = int, default = None)
     ap.add_argument("--output", default = None,
                     help = "override output path (default via save_result mirror)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    proj_paths = READ_PROJS if args.role == "read" else WRITE_PROJS
-    lrqat_variant = f"{args.role}_int{args.n_bits}"
+    proj_paths = (READ_PROJS if args.role == "read"
+                  else WRITE_PROJS if args.role == "write"
+                  else READ_PROJS + WRITE_PROJS)
+    layer_range = None
+    band = "all"
+    if args.layer_lo is not None and args.layer_hi is not None:
+        layer_range = (args.layer_lo, args.layer_hi)
+        band = f"L{args.layer_lo}-{args.layer_hi}"
+    lrqat_variant = f"{args.role}_int{args.n_bits}" + ("" if band == "all" else f"_{band}")
 
     print("=" * 74)
     print(f"  LR-QAT low-bit repair  |  role={args.role}  |  INT-{args.n_bits}")
     print(f"  {args.model} / {args.quantizer}  (Route A1 hybrid)")
     print(f"  projections: {proj_paths}")
+    print(f"  band: {band}"
+          + (f"  -> layers[{layer_range[0]},{layer_range[1]})" if layer_range else "  (all layers)"))
     print(f"  budget: steps={args.steps} accum={args.grad_accum} seq_len={args.seq_len} "
           f"lr={args.lr} rank={args.rank} alpha={args.alpha} group_size={args.group_size}")
     print(f"  train corpus: {TRAIN_CORPUS}")
@@ -345,10 +396,16 @@ def main():
     student, tokenizer = load_quantized(args.model, quantizer = args.quantizer)
     injected, trainable = inject_lrqat_adapters(
         student, proj_paths, n_bits = args.n_bits, rank = args.rank, alpha = args.alpha,
-        get_weight_fn = get_weight, group_size = args.group_size)
+        get_weight_fn = get_weight, group_size = args.group_size, layer_range = layer_range)
     eff_bits_repaired = injected_effective_bits(injected)
+    whole_eff_bits, bumped_frac = _whole_model_effective_bits(
+        student, proj_paths, layer_range, args.aqlm_eff_bits, eff_bits_repaired)
     print(f"  Repaired-matrix effective bits/weight: {eff_bits_repaired:.4f} "
           f"(INT-{args.n_bits}, group_size={args.group_size})")
+    if whole_eff_bits is not None:
+        print(f"  Whole-model effective bits/weight: ~{whole_eff_bits} "
+              f"(AQLM-2 base ~{args.aqlm_eff_bits} on {(1 - bumped_frac) * 100:.1f}% of quant "
+              f"params, INT-{args.n_bits} on {bumped_frac * 100:.1f}%)")
 
     # Effective-bit-width assertion (core control at n_bits=2)
     aqlm_nominal_bits = 2.0
@@ -485,6 +542,10 @@ def main():
         "aqlm_eff_bits_ceiling": args.aqlm_eff_bits,
         "group_size": args.group_size,
         "repaired_effective_bits": eff_bits_fused,
+        "whole_model_effective_bits": whole_eff_bits,
+        "bumped_fraction": bumped_frac,
+        "layer_range": list(layer_range) if layer_range else None,
+        "band": band,
         "bit_width_assert_ok": bit_assert_ok,
         "train_corpus": TRAIN_CORPUS,
         "contains_safety_data": False,
@@ -522,7 +583,7 @@ def main():
         model = args.model,
         quantizer = args.quantizer,
         variant = lrqat_variant,
-        extra = {"role": args.role, "n_bits": args.n_bits, "seed": SEED},
+        extra = {"role": args.role, "n_bits": args.n_bits, "band": band, "seed": SEED},
     )
     if args.output:
         out_path = Path(args.output)

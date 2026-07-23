@@ -323,6 +323,7 @@ def inject_lrqat_adapters(
     get_weight_fn,
     compute_dtype = torch.float16,
     group_size = 128,
+    layer_range = None,
     verbose = True,
 ):
     """
@@ -337,6 +338,8 @@ def inject_lrqat_adapters(
         - get_weight_fn (callable): Weight extractor (module, as_dtype=...)
         - compute_dtype (torch.dtype): Bias / compute dtype
         - group_size (int): PTQ group size
+        - layer_range (tuple | None): (lo, hi) to inject only on layers[lo:hi]
+          (depth-band hybrid); None injects on all layers
         - verbose (bool): Print injection summary
 
     Outputs:
@@ -350,9 +353,12 @@ def inject_lrqat_adapters(
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # Swap each selected projection for an LRQATLinear
+    # Swap each selected projection for an LRQATLinear (optionally band-limited)
+    lo, hi = layer_range if layer_range else (0, n_layers)
     injected = []
     for l in range(n_layers):
+        if not (lo <= l < hi):
+            continue
         layer = inner.layers[l]
         for proj in proj_paths:
             mod = _get_submodule(layer, proj)
@@ -381,9 +387,10 @@ def inject_lrqat_adapters(
 
     if verbose:
         n_train = sum(p.numel() for p in trainable)
+        band = f"layers[{lo},{hi})" if layer_range else "all-layers"
         print(
             f"  Injected {len(injected)} LRQATLinear adapters "
-            f"(n_bits={n_bits}, group_size={group_size}, rank={rank}, alpha={alpha})"
+            f"(n_bits={n_bits}, group_size={group_size}, rank={rank}, alpha={alpha}, band={band})"
         )
         print(
             f"  Trainable adapter params: {n_train:,} "
