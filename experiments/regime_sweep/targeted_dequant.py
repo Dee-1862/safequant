@@ -31,6 +31,41 @@ def _role_projs(model, role):
     return read + write
 
 
+# Nominal weight bit-width per quantizer, for the effective-bits accounting.
+QUANT_BITS = {"aqlm2": 2, "aqlm3": 3, "gptq2": 2, "gptq3": 3, "gptq4": 4,
+              "awq": 4, "fp32": 16}
+
+
+def _param_count(layer, proj_path):
+    """#params of one projection under a decoder layer (out x in)."""
+    m = layer
+    for part in proj_path.split("."):
+        m = getattr(m, part)
+    return int(m.weight.shape[0] * m.weight.shape[1])
+
+
+def effective_bits(model, role_projs, layer_range, base_q, src_q):
+    """Effective weight bit-width of the repaired model: base quantizer
+    everywhere, source quantizer on the restored (role x band) projections."""
+    read, write = get_proj_sets(model)
+    all_projs = read + write
+    n_layers = model.config.num_hidden_layers
+    layer0 = model.model.layers[0]
+    per_all = sum(_param_count(layer0, p) for p in all_projs)
+    per_role = sum(_param_count(layer0, p) for p in role_projs)
+    lo, hi = layer_range if layer_range else (0, n_layers)
+    total = per_all * n_layers
+    restored = per_role * (hi - lo)
+    frac = restored / total if total else 0.0
+    b_base, b_src = QUANT_BITS.get(base_q, 2), QUANT_BITS.get(src_q, 4)
+    return {
+        "base_bits": b_base, "source_bits": b_src,
+        "restored_params": restored, "total_quant_params": total,
+        "restored_fraction": round(frac, 4),
+        "effective_bits": round(b_base * (1 - frac) + b_src * frac, 3),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Targeted 4-bit (AWQ) restoration into the 2-bit (AQLM) cell.")
@@ -63,6 +98,10 @@ def main():
     fp32_model, tokenizer = load_fp32(args.model)
     projs = _role_projs(fp32_model, args.role)
     fp32_weights = extract_fp32_weights(fp32_model, projs)
+    eff = effective_bits(fp32_model, projs, layer_range, qtz, src)
+    print(f"  effective_bits={eff['effective_bits']} "
+          f"(base {eff['base_bits']}b -> {eff['source_bits']}b on "
+          f"{eff['restored_fraction']*100:.1f}% of quant params)")
     all_responses["fp32"] = generate_only(fp32_model, tokenizer, items, desc="FP32")
     all_arc["fp32"] = measure_arc(fp32_model, tokenizer, arc_items)
     del fp32_model
@@ -121,6 +160,7 @@ def main():
         "asr_per_condition": asr, "arc_per_condition": all_arc,
         "recovery_pp_4bit": rec_4bit, "recovery_pp_fp32": rec_fp32,
         "frac_of_fp32_recovery": frac,
+        "effective_bits": eff,
     }
     path = save_result(_SCRIPT, cfg, data)
     print(f"Saved to {path}")
