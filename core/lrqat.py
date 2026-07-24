@@ -233,6 +233,34 @@ class LRQATLinear(nn.Module):
         self.lora_A.data.zero_()
         self.merged = True
 
+    @torch.no_grad()
+    def closed_form_fill(self, weight_fp, rank = None):
+        """
+        Training-free repair: fold the top-r SVD of the quantization residual
+        (W_fp - dequant(W_int)) into the INT grid. This is the closed-form
+        analogue of the distilled low-rank adapter -- same slot, same bit-width,
+        no gradient steps. The correction is requantized into the existing grid,
+        so effective bits are unchanged.
+
+        Inputs:
+            - weight_fp (torch.Tensor): FP16/FP32 target (teacher) weight
+            - rank (int | None): correction rank (defaults to the adapter rank)
+
+        Outputs:
+            - None
+        """
+        r = self.rank if rank is None else int(rank)
+        scale_full = self._scale_full().float()
+        W_deq = scale_full * self.W_int.float()
+        R = weight_fp.float().to(W_deq.device) - W_deq
+        U, S, Vh = torch.linalg.svd(R, full_matrices = False)
+        r = min(r, S.numel())
+        R_r = (U[:, :r] * S[:r]) @ Vh[:r, :]
+        delta_int = torch.round(R_r / scale_full)
+        self.W_int.copy_(torch.clamp(self.W_int + delta_int, self.qmin, self.qmax))
+        self.lora_A.data.zero_()
+        self.merged = True
+
     def effective_bits(self):
         """
         Effective storage bits/weight once fused (codes + fp16 scales).
@@ -375,6 +403,8 @@ def inject_lrqat_adapters(
                 compute_dtype = compute_dtype,
                 group_size = group_size,
             )
+            new._lrqat_layer = l
+            new._lrqat_proj = proj
             _set_submodule(layer, proj, new)
             injected.append(new)
 
@@ -415,6 +445,29 @@ def merge_all(injected, verbose = True):
     if verbose:
         print(
             f"  Fused {len(injected)} adapters back into INT-{injected[0].n_bits} grid"
+        )
+
+
+def closed_form_all(injected, get_teacher_weight, rank = None, verbose = True):
+    """
+    Fill every injected adapter with a closed-form low-rank residual correction.
+
+    Inputs:
+        - injected (list): Injected LRQATLinear modules
+        - get_teacher_weight (callable): module -> FP target weight tensor
+        - rank (int | None): correction rank (defaults to each adapter's rank)
+        - verbose (bool): Print summary
+
+    Outputs:
+        - None
+    """
+    for m in injected:
+        m.closed_form_fill(get_teacher_weight(m), rank = rank)
+    if verbose:
+        used_r = rank if rank is not None else injected[0].rank
+        print(
+            f"  Closed-form filled {len(injected)} adapters "
+            f"(top-{used_r} SVD residual, fused into INT-{injected[0].n_bits} grid)"
         )
 
 
