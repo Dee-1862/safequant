@@ -13,9 +13,13 @@ from pathlib import Path
 
 import torch
 
-from core.datasets import load_arc_challenge, load_wildjailbreak_prompts, load_xstest
+from core.datasets import (
+    load_arc_challenge, load_wildjailbreak_prompts, load_xstest, load_c4_calibration,
+)
 from core.evaluation import _extract_behavior, classify_batch, eval_xstest, generate_only
-from core.lrqat import inject_lrqat_adapters, closed_form_all, injected_effective_bits
+from core.lrqat import (
+    inject_lrqat_adapters, closed_form_all, activation_aware_fill, injected_effective_bits,
+)
 from core.manifest import RunConfig, find_result, save_result
 from core.model_loader import load_fp32, load_quantized, get_weight
 from core.residuals import get_inner
@@ -85,6 +89,19 @@ def recovery_fraction(asr_repaired, asr_quant, asr_fp16):
     return (asr_quant - asr_repaired) / denom
 
 
+def calib_blocks(tokenizer, n_blocks, seq_len):
+    """Fixed-length C4 token blocks for the activation-aware calibration pass."""
+    docs = load_c4_calibration(n_samples=max(64, n_blocks * 4))
+    ids = []
+    for d in docs:
+        ids.extend(tokenizer(d, add_special_tokens=False).input_ids)
+        ids.append(tokenizer.eos_token_id)
+    nb = min(n_blocks, len(ids) // seq_len)
+    if nb == 0:
+        raise RuntimeError("C4 produced too few tokens for calibration; raise n_blocks")
+    return torch.tensor(ids[: nb * seq_len], dtype=torch.long).view(nb, seq_len)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Training-free closed-form (SVD-residual) repair of role projections.")
@@ -94,7 +111,15 @@ def main():
     ap.add_argument("--n_bits", type=int, default=3,
                     help="INT grid the corrected role matrices sit on (matched to lrqat)")
     ap.add_argument("--group_size", type=int, default=128)
-    ap.add_argument("--rank", type=int, default=32, help="SVD correction rank")
+    ap.add_argument("--rank", type=int, default=32, help="SVD correction rank (weight_svd mode)")
+    ap.add_argument("--cf_mode", choices=["weight_svd", "act_aware"], default="weight_svd",
+                    help="weight_svd = top-r SVD of the weight residual (toward FP16 weights); "
+                         "act_aware = ridge LS matching FP16 OUTPUTS on calibration activations")
+    ap.add_argument("--n_calib_blocks", type=int, default=32,
+                    help="C4 blocks for the act_aware calibration pass")
+    ap.add_argument("--calib_seq_len", type=int, default=512)
+    ap.add_argument("--ridge", type=float, default=1e-2,
+                    help="ridge strength (relative to mean diag of A) for act_aware solve")
     ap.add_argument("--aqlm_eff_bits", type=float, default=2.2,
                     help="AQLM-2 effective-bit proxy for the whole-model accounting")
     ap.add_argument("--layer_lo", type=int, default=None,
@@ -115,11 +140,14 @@ def main():
     if args.layer_lo is not None and args.layer_hi is not None:
         layer_range = (args.layer_lo, args.layer_hi)
         band = f"L{args.layer_lo}-{args.layer_hi}"
-    variant = f"{args.role}_int{args.n_bits}" + ("" if band == "all" else f"_{band}") + "_cf"
+    mode_tag = "cf" if args.cf_mode == "weight_svd" else "cfaa"
+    variant = f"{args.role}_int{args.n_bits}" + ("" if band == "all" else f"_{band}") + f"_{mode_tag}"
+    repair_mode = "closed_form_svd" if args.cf_mode == "weight_svd" else "closed_form_act_aware"
 
     print("=" * 74)
     print(f"  CLOSED-FORM repair (NO training)  |  role={args.role}  |  INT-{args.n_bits}")
-    print(f"  {args.model} / {args.quantizer}  |  band={band}  |  rank={args.rank}")
+    print(f"  {args.model} / {args.quantizer}  |  band={band}  |  cf_mode={args.cf_mode}  "
+          f"|  rank={args.rank}")
     print(f"  projections: {proj_paths}")
     print(f"  eval: n_eval={args.n_eval}  n_reasoning={args.n_reasoning}  "
           f"n_xstest={args.n_xstest}  seed={SEED}")
@@ -157,20 +185,28 @@ def main():
     all_xs["ptq_untrained"] = (eval_xstest(student, tokenizer, xstest_items, desc="XS-ptq")
                                ["false_refusal_rate"] if xstest_items else None)
 
-    # Closed-form fill: top-r SVD of the FP-vs-quant residual, folded into the grid
-    print("\n[3] Loading FP teacher weights and applying closed-form correction ...")
+    # Closed-form correction (training-free). Two modes:
+    #   weight_svd  -> top-r SVD of the FP-vs-quant weight residual (toward FP16 weights)
+    #   act_aware   -> ridge LS matching FP16 OUTPUTS on calibration activations
+    print(f"\n[3] Loading FP teacher and applying closed-form correction ({args.cf_mode}) ...")
     teacher, _ = load_fp32(args.model)
     for p in teacher.parameters():
         p.requires_grad_(False)
-    t_inner = get_inner(teacher)
 
-    def _teacher_weight(m):
-        sub = t_inner.layers[m._lrqat_layer]
-        for part in m._lrqat_proj.split("."):
-            sub = getattr(sub, part)
-        return get_weight(sub, as_dtype=torch.float32)
+    if args.cf_mode == "act_aware":
+        print("  building C4 calibration blocks ...")
+        blocks = calib_blocks(tokenizer, args.n_calib_blocks, args.calib_seq_len)
+        activation_aware_fill(injected, student, teacher, blocks, device, ridge=args.ridge)
+    else:
+        t_inner = get_inner(teacher)
 
-    closed_form_all(injected, _teacher_weight, rank=args.rank)
+        def _teacher_weight(m):
+            sub = t_inner.layers[m._lrqat_layer]
+            for part in m._lrqat_proj.split("."):
+                sub = getattr(sub, part)
+            return get_weight(sub, as_dtype=torch.float32)
+
+        closed_form_all(injected, _teacher_weight, rank=args.rank)
     del teacher
     gc.collect()
     torch.cuda.empty_cache()
@@ -221,7 +257,8 @@ def main():
 
     data = {
         "model": args.model, "quantizer": args.quantizer,
-        "repair_mode": "closed_form_svd", "role": args.role, "proj_paths": proj_paths,
+        "repair_mode": repair_mode, "cf_mode": args.cf_mode,
+        "role": args.role, "proj_paths": proj_paths,
         "n_bits": args.n_bits, "rank": args.rank, "group_size": args.group_size,
         "band": band, "layer_range": list(layer_range) if layer_range else None,
         "seed": SEED,

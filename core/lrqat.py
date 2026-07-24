@@ -471,6 +471,99 @@ def closed_form_all(injected, get_teacher_weight, rank = None, verbose = True):
         )
 
 
+@torch.no_grad()
+def activation_aware_fill(injected, student, teacher, calib_blocks, device,
+                          ridge = 1e-2, verbose = True):
+    """
+    Training-free OUTPUT-matching repair (the fix for weight-SVD's failure).
+
+    For each injected role projection, accumulate over calibration blocks the
+    second moment of the student's quantized INPUT activations (A = sum x x^T)
+    and their cross moment with the teacher's FP OUTPUT (B = sum y x^T), then set
+    the projection to the ridge least-squares weight W* = B (A + lam I)^-1 -- the
+    weight that best maps the quantized inputs to the FP outputs -- and requantize
+    W* into the INT grid. Because W* is a COMPENSATORY target (matches outputs,
+    not weights), it differs from W_fp by integer-level amounts and survives the
+    grid rounding that zeroes out the sub-step weight-SVD correction.
+
+    Inputs:
+        - injected (list): Injected LRQATLinear modules (need ._lrqat_layer/_proj)
+        - student (nn.Module): quantized student holding the injected modules
+        - teacher (nn.Module): frozen FP teacher (same architecture)
+        - calib_blocks (Tensor): [n_blocks, seq_len] CPU token blocks
+        - device: forward device
+        - ridge (float): ridge strength, relative to the mean diagonal of A
+        - verbose (bool): print progress
+
+    Outputs:
+        - None
+    """
+    t_inner = get_inner(teacher)
+
+    def _teacher_mod(m):
+        sub = t_inner.layers[m._lrqat_layer]
+        for part in m._lrqat_proj.split("."):
+            sub = getattr(sub, part)
+        return sub
+
+    # Pair each teacher projection module with its injected student counterpart.
+    tmod_to_inj = {_teacher_mod(m): m for m in injected}
+
+    A = {id(m): None for m in injected}   # in x in  (student input second moment)
+    B = {id(m): None for m in injected}   # out x in (teacher-output x student-input)
+    xcache = {}                           # id(inj) -> this block's flattened input
+
+    def s_pre_hook(mod, args):
+        x = args[0]
+        xcache[id(mod)] = x.detach().reshape(-1, x.shape[-1]).float()
+
+    def t_out_hook(mod, args, out):
+        inj = tmod_to_inj[mod]
+        if id(inj) not in xcache:
+            return
+        y = out.detach().reshape(-1, out.shape[-1]).float()
+        x = xcache[id(inj)]
+        aa, bb = x.transpose(0, 1) @ x, y.transpose(0, 1) @ x
+        A[id(inj)] = aa if A[id(inj)] is None else A[id(inj)] + aa
+        B[id(inj)] = bb if B[id(inj)] is None else B[id(inj)] + bb
+
+    s_handles = [m.register_forward_pre_hook(s_pre_hook) for m in injected]
+    t_handles = [tm.register_forward_hook(t_out_hook) for tm in tmod_to_inj]
+
+    student.eval()
+    teacher.eval()
+    nb = calib_blocks.size(0)
+    for i in range(nb):
+        xb = calib_blocks[i:i + 1].to(device)
+        xcache.clear()
+        student(input_ids = xb)   # fills xcache via student pre-hooks
+        teacher(input_ids = xb)   # accumulates A / B via teacher output hooks
+        if verbose and (i + 1) % 8 == 0:
+            print(f"    calib block {i + 1}/{nb}")
+    for h in s_handles + t_handles:
+        h.remove()
+
+    # Solve the ridge least-squares per projection and requantize into the grid.
+    for m in injected:
+        a, b = A[id(m)], B[id(m)]
+        if a is None:
+            continue
+        lam = ridge * (a.diagonal().mean().item() + 1e-8)
+        eye = torch.eye(a.shape[0], device = a.device, dtype = a.dtype)
+        Wstar = torch.linalg.solve(a + lam * eye, b.transpose(0, 1)).transpose(0, 1)
+        scale_full = m._scale_full().float()
+        W_int_new = torch.clamp(torch.round(Wstar / scale_full), m.qmin, m.qmax)
+        m.W_int.copy_(W_int_new.to(m.W_int.dtype))
+        m.lora_A.data.zero_()
+        m.merged = True
+        A[id(m)] = B[id(m)] = None
+        del a, b, eye, Wstar, W_int_new
+        torch.cuda.empty_cache()
+    if verbose:
+        print(f"  Activation-aware filled {len(injected)} projections "
+              f"(ridge LS output-matching, requantized into INT-{injected[0].n_bits} grid)")
+
+
 def injected_effective_bits(injected):
     """
     Mean effective bits/weight across all injected (repaired) matrices.
